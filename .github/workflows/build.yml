@@ -1,0 +1,205 @@
+name: Maximum Evidence LibreWolf Helium Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build identity
+        shell: pwsh
+        run: |
+          git rev-parse HEAD > BUILD-COMMIT.txt
+          git status --short > GIT-STATUS.txt
+          rustc --version > RUST-VERSION.txt
+          cargo --version >> RUST-VERSION.txt
+          Get-FileHash .github/workflows/build.yml -Algorithm SHA256 | Format-List > WORKFLOW-HASH.txt
+
+      - name: Fetch locked dependencies
+        shell: pwsh
+        run: cargo fetch --locked
+
+      - name: Test workspace
+        shell: pwsh
+        run: cargo test --locked --workspace
+
+      - name: Build only LibreWolf and Helium
+        shell: pwsh
+        run: cargo build --locked --release -p nomad-librewolf -p nomad-helium
+
+      - name: Generate hashes and signatures
+        shell: pwsh
+        run: |
+          $files = @(
+            "target/release/Nomad-LibreWolf.exe",
+            "target/release/Nomad-Helium.exe"
+          )
+
+          $hashLines = foreach ($f in $files) {
+            $name = Split-Path $f -Leaf
+            $h = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "$h  $name"
+          }
+          $hashLines | Set-Content -Encoding ascii SHA256SUMS.txt
+
+          $report = foreach ($f in $files) {
+            $item = Get-Item $f
+            $sig = Get-AuthenticodeSignature $f
+            [PSCustomObject]@{
+              File = $item.Name
+              SizeBytes = $item.Length
+              SHA256 = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+              SHA512 = (Get-FileHash $f -Algorithm SHA512).Hash.ToLower()
+              AuthenticodeStatus = $sig.Status
+              Signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+              Thumbprint = if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { "" }
+            }
+          }
+          $report | Format-List | Out-File -Encoding utf8 hash-signature-report.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Install cargo-audit
+        shell: pwsh
+        run: cargo install cargo-audit --locked
+
+      - name: Dependency evidence
+        shell: pwsh
+        run: |
+          cargo audit *> cargo-audit.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "cargo audit found advisories; saved to cargo-audit.txt"
+            $global:LASTEXITCODE = 0
+          }
+
+          cargo tree -p nomad-librewolf > cargo-tree-librewolf.txt
+          cargo tree -p nomad-helium > cargo-tree-helium.txt
+          cargo tree -i rsa > cargo-tree-rsa.txt 2>&1
+          cargo tree -i pgp > cargo-tree-pgp.txt 2>&1
+          cargo tree -i async-std > cargo-tree-async-std.txt 2>&1
+          cargo tree -i paste > cargo-tree-paste.txt 2>&1
+          cargo tree -i ttf-parser > cargo-tree-ttf-parser.txt 2>&1
+          cargo tree -i anyhow > cargo-tree-anyhow.txt 2>&1
+          cargo tree -i memmap2 > cargo-tree-memmap2.txt 2>&1
+          cargo metadata --locked --format-version 1 > cargo-metadata.json
+
+      - name: Verify embedded 7-Zip against official 7-Zip 24.09
+        shell: pwsh
+        run: |
+          $officialUrl = "https://www.7-zip.org/a/7z2409-x64.exe"
+          Invoke-WebRequest -Uri $officialUrl -OutFile official-7zip.exe
+
+          $system7z = "${env:ProgramFiles}\7-Zip\7z.exe"
+          if (!(Test-Path $system7z)) {
+            throw "System 7-Zip not found at $system7z"
+          }
+
+          New-Item -ItemType Directory -Force official-7zip | Out-Null
+          & $system7z x .\official-7zip.exe "-oofficial-7zip" -y | Out-Null
+
+          $officialExe = Get-ChildItem official-7zip -Recurse -Filter 7z.exe | Select-Object -First 1
+          $officialDll = Get-ChildItem official-7zip -Recurse -Filter 7z.dll | Select-Object -First 1
+
+          if (!$officialExe) { throw "Could not find official 7z.exe after extraction" }
+          if (!$officialDll) { throw "Could not find official 7z.dll after extraction" }
+
+          $embeddedExeHash = (Get-FileHash ".\core\payloads\7zip\7z.exe" -Algorithm SHA256).Hash.ToUpper()
+          $embeddedDllHash = (Get-FileHash ".\core\payloads\7zip\7z.dll" -Algorithm SHA256).Hash.ToUpper()
+          $officialExeHash = (Get-FileHash $officialExe.FullName -Algorithm SHA256).Hash.ToUpper()
+          $officialDllHash = (Get-FileHash $officialDll.FullName -Algorithm SHA256).Hash.ToUpper()
+
+          @"
+          === Official 7-Zip URL ===
+          $officialUrl
+
+          === Embedded 7z.exe SHA256 ===
+          $embeddedExeHash
+
+          === Official 7z.exe SHA256 ===
+          $officialExeHash
+
+          === Embedded 7z.dll SHA256 ===
+          $embeddedDllHash
+
+          === Official 7z.dll SHA256 ===
+          $officialDllHash
+
+          === 7z.exe Match ===
+          $($embeddedExeHash -eq $officialExeHash)
+
+          === 7z.dll Match ===
+          $($embeddedDllHash -eq $officialDllHash)
+
+          === Embedded 7z.exe Signature ===
+          $(Get-AuthenticodeSignature ".\core\payloads\7zip\7z.exe" | Format-List | Out-String)
+
+          === Embedded 7z.dll Signature ===
+          $(Get-AuthenticodeSignature ".\core\payloads\7zip\7z.dll" | Format-List | Out-String)
+
+          === Official 7z.exe Signature ===
+          $(Get-AuthenticodeSignature $officialExe.FullName | Format-List | Out-String)
+
+          === Official 7z.dll Signature ===
+          $(Get-AuthenticodeSignature $officialDll.FullName | Format-List | Out-String)
+          "@ | Set-Content -Encoding utf8 7zip-check.txt
+
+          if ($embeddedExeHash -ne $officialExeHash) { throw "Embedded 7z.exe does not match official 7-Zip 24.09" }
+          if ($embeddedDllHash -ne $officialDllHash) { throw "Embedded 7z.dll does not match official 7-Zip 24.09" }
+
+      - name: Upload evidence and binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nomad-librewolf-helium-maximum-evidence
+          path: |
+            target/release/Nomad-LibreWolf.exe
+            target/release/Nomad-Helium.exe
+            SHA256SUMS.txt
+            hash-signature-report.txt
+            cargo-audit.txt
+            cargo-tree-librewolf.txt
+            cargo-tree-helium.txt
+            cargo-tree-rsa.txt
+            cargo-tree-pgp.txt
+            cargo-tree-async-std.txt
+            cargo-tree-paste.txt
+            cargo-tree-ttf-parser.txt
+            cargo-tree-anyhow.txt
+            cargo-tree-memmap2.txt
+            cargo-metadata.json
+            7zip-check.txt
+            BUILD-COMMIT.txt
+            GIT-STATUS.txt
+            RUST-VERSION.txt
+            WORKFLOW-HASH.txt
+          retention-days: 7
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: |
+            target/release/Nomad-LibreWolf.exe
+            target/release/Nomad-Helium.exe
+            SHA256SUMS.txt
+            hash-signature-report.txt
+            cargo-audit.txt
+            7zip-check.txt
+            BUILD-COMMIT.txt
+            RUST-VERSION.txt
+            WORKFLOW-HASH.txt
